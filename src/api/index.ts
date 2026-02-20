@@ -38,6 +38,7 @@ import {
 	SyntheticHandler,
 	OVHcloudAIEndpointsHandler,
 	SapAiCoreHandler,
+	ApertisHandler,
 	// kilocode_change end
 	ClaudeCodeHandler,
 	QwenCodeHandler,
@@ -98,6 +99,13 @@ export interface ApiHandlerCreateMessageMetadata {
 	 * @kilocode-only
 	 */
 	projectId?: string
+	/**
+	 * KiloCode-specific: Feature attribution for microdollar usage tracking.
+	 * When set, overrides the default feature detection in customRequestOptions().
+	 * Examples: 'parallel-agent', 'autocomplete'
+	 * @kilocode-only
+	 */
+	feature?: string
 	// kilocode_change end
 	/**
 	 * Optional array of tool definitions to pass to the model.
@@ -257,6 +265,8 @@ export function buildApiHandler(configuration: ProviderSettings): ApiHandler {
 			return new OVHcloudAIEndpointsHandler(options)
 		case "sap-ai-core":
 			return new SapAiCoreHandler(options)
+		case "apertis":
+			return new ApertisHandler(options)
 		// kilocode_change end
 		case "io-intelligence":
 			return new IOIntelligenceHandler(options)

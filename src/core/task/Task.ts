@@ -139,13 +139,20 @@ import { parseKiloSlashCommands } from "../slash-commands/kilo" // kilocode_chan
 import { GlobalFileNames } from "../../shared/globalFileNames" // kilocode_change
 import { ensureLocalKilorulesDirExists } from "../context/instructions/kilo-rules" // kilocode_change
 import { processUserContentMentions } from "../mentions/processUserContentMentions"
-import { getMessagesSinceLastSummary, summarizeConversation, getEffectiveApiHistory } from "../condense"
+import {
+	getMessagesSinceLastSummary,
+	summarizeConversation,
+	getEffectiveApiHistory,
+	uncondenseForExtendedThinking,
+} from "../condense"
 import { MessageQueueService } from "../message-queue/MessageQueueService"
 
 import {
 	isAnyRecognizedKiloCodeError,
 	isPaymentRequiredError,
-	isUnauthorizedError,
+	isUnauthorizedGenericError,
+	isUnauthorizedPaidModelError,
+	isUnauthorizedPromotionLimitError,
 } from "../../shared/kilocode/errorUtils"
 import { getAppUrl } from "@roo-code/types"
 import { getKilocodeDefaultModel } from "../../api/providers/kilocode/getKilocodeDefaultModel" // kilocode_change
@@ -153,6 +160,7 @@ import { addOrMergeUserContent } from "./kilocode"
 import { AutoApprovalHandler, checkAutoApproval } from "../auto-approval"
 import { MessageManager } from "../message-manager"
 import { validateAndFixToolResultIds } from "./validateToolResultIds"
+import { deduplicateToolUseBlocks } from "./deduplicateToolUseBlocks"
 
 const MAX_EXPONENTIAL_BACKOFF_SECONDS = 600 // 10 minutes
 const DEFAULT_USAGE_COLLECTION_TIMEOUT_MS = 5000 // 5 seconds
@@ -3794,9 +3802,22 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						}
 					}
 
+					// Deduplicate tool_use blocks to prevent "unexpected tool_use_id" API errors
+					// This handles edge cases like long waits during orchestrator sessions
+					// Skip deduplication if 0-1 tool_use blocks (no duplicates possible)
+					const assistantApiMessage: Anthropic.MessageParam = {
+						role: "assistant",
+						content: assistantContent,
+					}
+
+					const deduplicatedAssistantMessage =
+						toolUseBlocks.length > 1
+							? deduplicateToolUseBlocks(assistantApiMessage) // Deduplicate if multiple tools
+							: assistantApiMessage
+
 					await this.addToApiConversationHistory(
-						{ role: "assistant", content: assistantContent },
-						reasoningMessage || undefined,
+						deduplicatedAssistantMessage,
+						reasoningMessage || undefined, // Include reasoning if present
 					)
 
 					TelemetryService.instance.captureConversationMessage(this.taskId, "assistant")
@@ -3826,6 +3847,11 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					)
 
 					if (!didToolUse) {
+						// Check for hallucinated tool use pattern
+						const hallucinatedTool = this.assistantMessageContent.find(
+							(block) => block.type === "text" && block.content.trim().match(/^\[Tool Use: .+\]/i),
+						)
+
 						// Increment consecutive no-tool-use counter
 						this.consecutiveNoToolUseCount++
 
@@ -3836,10 +3862,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 							this.consecutiveMistakeCount++
 						}
 
+						let responseText = formatResponse.noToolsUsed(this._taskToolProtocol ?? "xml")
+
+						if (hallucinatedTool) {
+							responseText +=
+								"\n\n[ERROR] You are outputting tool calls as text (e.g. '[Tool Use: ...]'). This is invalid. You MUST use the native tool calling capability provided by the API. Do not write the tool use in the text response."
+						}
+
 						// Use the task's locked protocol for consistent behavior
 						this.userMessageContent.push({
 							type: "text",
-							text: formatResponse.noToolsUsed(this._taskToolProtocol ?? "xml"),
+							text: responseText,
 						})
 					} else {
 						// Reset counter when tools are used successfully
@@ -4499,6 +4532,56 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			}
 		}
 
+		// kilocode_change start
+		// Check if history has summary messages that are incompatible with extended thinking.
+		// This can happen when a conversation was condensed with a different model and is now
+		// being used with an Anthropic extended thinking model. If so, uncondense by removing
+		// the invalid summary and restoring the condensed messages, then re-condense with the
+		// current model (which will produce valid thinking blocks).
+		const currentModelInfo = this.api.getModel().info
+		const uncondenseResult = uncondenseForExtendedThinking(this.apiConversationHistory, currentModelInfo)
+		if (uncondenseResult.didUncondense) {
+			console.log(
+				`[Task#${this.taskId}] Uncondensed history for extended thinking compatibility - removed invalid summary`,
+			)
+			this.apiConversationHistory = uncondenseResult.messages
+			await this.saveApiConversationHistory()
+
+			// After uncondensing, immediately re-condense with the current model to avoid context overflow.
+			// The current model (with extended thinking) will produce valid thinking blocks.
+			const prevContextTokens = await this.api.countTokens(
+				this.apiConversationHistory.flatMap((m) =>
+					typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content,
+				),
+			)
+			console.log(`[Task#${this.taskId}] Re-condensing after uncondense - context tokens: ${prevContextTokens}`)
+
+			const recondenseResult = await summarizeConversation(
+				this.apiConversationHistory,
+				this.api,
+				await this.getSystemPrompt(),
+				this.taskId,
+				prevContextTokens,
+				true, // isAutomaticTrigger
+				undefined, // customCondensingPrompt - use default
+				undefined, // condensingApiHandler - use main handler (current model with extended thinking)
+				this._taskToolProtocol === "native",
+			)
+
+			if (recondenseResult.error) {
+				console.error(`[Task#${this.taskId}] Re-condensation failed: ${recondenseResult.error}`)
+				// Don't throw - let it continue and potentially fail with context overflow
+				// User will see the error and can manually handle it
+			} else {
+				console.log(
+					`[Task#${this.taskId}] Re-condensation successful - new context tokens: ${recondenseResult.newContextTokens}`,
+				)
+				this.apiConversationHistory = recondenseResult.messages
+				await this.saveApiConversationHistory()
+			}
+		}
+		// kilocode_change end
+
 		// Get the effective API history by filtering out condensed messages
 		// This allows non-destructive condensing where messages are tagged but not deleted,
 		// enabling accurate rewind operations while still sending condensed history to the API.
@@ -4595,6 +4678,8 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 					}
 				: {}),
 			projectId: (await kiloConfig)?.project?.id, // kilocode_change: pass projectId for backend tracking (ignored by other providers)
+			// kilocode_change: child tasks (spawned via new_task tool) are parallel agents
+			...(this.parentTaskId ? { feature: "parallel-agent" } : {}),
 		}
 
 		// Create an AbortController to allow cancelling the request mid-stream
@@ -4651,34 +4736,49 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 						apiConfiguration.kilocodeOrganizationId,
 					)
 				).defaultFreeModel
-				const { response } = await (isPaymentRequiredError(error)
-					? this.ask(
-							"payment_required_prompt",
-							JSON.stringify({
-								title: error.error?.title ?? t("kilocode:lowCreditWarning.title"),
-								message: error.error?.message ?? t("kilocode:lowCreditWarning.message"),
-								balance: error.error?.balance ?? "0.00",
-								buyCreditsUrl: error.error?.buyCreditsUrl ?? getAppUrl("/profile"),
-								defaultFreeModel,
-							}),
-						)
-					: isUnauthorizedError(error)
-						? this.ask(
-								"unauthorized_prompt",
-								JSON.stringify({
-									modelId: apiConfiguration.kilocodeModel,
-								}),
-							)
-						: this.ask(
-								"invalid_model",
-								JSON.stringify({
-									modelId: apiConfiguration.kilocodeModel,
-									error: {
-										status: error.status,
-										message: error.message,
-									},
-								}),
-							))
+
+				let askResponse: { response: string }
+
+				if (isPaymentRequiredError(error)) {
+					askResponse = await this.ask(
+						"payment_required_prompt",
+						JSON.stringify({
+							title: error.error?.title ?? t("kilocode:lowCreditWarning.title"),
+							message: error.error?.message ?? t("kilocode:lowCreditWarning.message"),
+							balance: error.error?.balance ?? "0.00",
+							buyCreditsUrl: error.error?.buyCreditsUrl ?? getAppUrl("/profile"),
+							defaultFreeModel,
+						}),
+					)
+				} else if (isUnauthorizedPromotionLimitError(error)) {
+					askResponse = await this.ask(
+						"promotion_model_sign_up_required_prompt",
+						JSON.stringify({
+							modelId: apiConfiguration.kilocodeModel,
+						}),
+					)
+				} else if (isUnauthorizedPaidModelError(error) || isUnauthorizedGenericError(error)) {
+					askResponse = await this.ask(
+						"unauthorized_prompt",
+						JSON.stringify({
+							modelId: apiConfiguration.kilocodeModel,
+						}),
+					)
+				} else {
+					askResponse = await this.ask(
+						"invalid_model",
+						JSON.stringify({
+							modelId: apiConfiguration.kilocodeModel,
+							error: {
+								status: error.status,
+								message: error.message,
+							},
+						}),
+					)
+				}
+
+				const { response } = askResponse
+
 				this.currentRequestAbortController = undefined
 				const isContextWindowExceededError = checkContextWindowExceededError(error)
 
@@ -4737,7 +4837,17 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 				yield* this.attemptApiRequest()
 				return
 			}
+			// kilocode_change start
+		} finally {
+			// Clean up abort listeners to prevent memory leaks.
+			// Both listeners are only needed during the first-chunk phase,
+			// so it's safe to remove them here before consuming the rest of the stream.
+			abortSignal.removeEventListener("abort", abortCleanupListener)
+			if (firstChunkAbortListener) {
+				abortSignal.removeEventListener("abort", firstChunkAbortListener)
+			}
 		}
+		// kilocode_change end
 
 		// No error, so we can continue to yield all remaining chunks.
 		// (Needs to be placed outside of try/catch since it we want caller to
@@ -4754,12 +4864,6 @@ export class Task extends EventEmitter<TaskEvents> implements TaskLike {
 			Task.lastGlobalApiRequestTime = performance.now()
 		}
 		// kilocode_change end
-
-		// Clean up abort listeners to prevent memory leaks
-		abortSignal.removeEventListener("abort", abortCleanupListener)
-		if (firstChunkAbortListener) {
-			abortSignal.removeEventListener("abort", firstChunkAbortListener)
-		}
 	}
 
 	// Shared exponential backoff for retries (first-chunk and mid-stream)

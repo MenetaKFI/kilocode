@@ -87,6 +87,7 @@ import { formatFileSize } from "@/lib/formatting-utils"
 import ChatTimestamps from "./ChatTimestamps"
 import { removeLeadingNonAlphanumeric } from "@/utils/removeLeadingNonAlphanumeric"
 import { KILOCODE_TOKEN_REQUIRED_ERROR } from "@roo/kilocode/errorUtils"
+import { PromotionWarning } from "../kilocode/chat/PromotionWarning"
 // kilocode_change end
 
 // Helper function to get previous todos before a specific message
@@ -1362,7 +1363,7 @@ export const ChatRowContent = ({
 									isEditing ? "overflow-visible" : "overflow-hidden", // kilocode_change
 									isEditing
 										? "bg-vscode-editor-background text-vscode-editor-foreground"
-										: "cursor-text p-1 bg-vscode-sideBar-background text-vscode-foreground", // kilocode_change
+										: "cursor-text p-1 bg-vscode-editor-background text-vscode-editor-foreground border-vscode-editorGroup-border", // kilocode_change
 								)}>
 								{isEditing ? (
 									<div className="flex flex-col gap-2">
@@ -1875,6 +1876,9 @@ export const ChatRowContent = ({
 				}
 				case "unauthorized_prompt": {
 					return <UnauthorizedWarning message={message} />
+				}
+				case "promotion_model_sign_up_required_prompt": {
+					return <PromotionWarning message={message} />
 				}
 				case "invalid_model": {
 					return <InvalidModelWarning message={message} isLast={isLast} />
